@@ -13,6 +13,13 @@ Design notes
   content under the same id raises a conflict.
 * Failed deliveries never touch ``deliveries``; they are only audited in
   ``delivery_attempts`` (audit rows are not a successful identity).
+* Segment calibration and paired delivery are strictly additive: their tables
+  are created with ``IF NOT EXISTS`` alongside the original schema, so opening
+  a store written by an older version keeps every observation/reference/
+  product/delivery row readable.  Pulses reuse the observation revision rules
+  (append by ``(pulse_id, revision)``, highest wins, conflicts reject a batch).
+  Calibration products and paired deliveries are immutable with a content
+  digest; a refused (inconsistent/NONE) request writes only an audit row.
 """
 
 from __future__ import annotations
@@ -156,6 +163,116 @@ CREATE TABLE IF NOT EXISTS delivery_attempts (
     status          TEXT NOT NULL,
     reasons_json    TEXT NOT NULL,
     created_at      TEXT NOT NULL
+);
+
+-- -------------------------------------------------------------------------
+-- Segment calibration (time-sync pulses) and paired-exposure delivery.
+-- These tables only ever get added; opening an older store keeps every
+-- pre-existing observation/reference/product/delivery row readable.
+-- -------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS calibration_segments (
+    segment_id   TEXT PRIMARY KEY,
+    station_id   TEXT NOT NULL,
+    slope_lo     TEXT NOT NULL,
+    slope_hi     TEXT NOT NULL,
+    content_digest TEXT NOT NULL,
+    created_at   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS calibration_pulse_admissions (
+    admission_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    segment_id    TEXT NOT NULL,
+    batch_digest  TEXT NOT NULL UNIQUE,
+    accepted      INTEGER NOT NULL,
+    outcome       TEXT NOT NULL,
+    canonical     TEXT NOT NULL,
+    created_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS calibration_pulse_batch_member (
+    admission_id  INTEGER NOT NULL REFERENCES calibration_pulse_admissions(admission_id),
+    pulse_id      TEXT NOT NULL,
+    revision      INTEGER NOT NULL,
+    tick          INTEGER NOT NULL,
+    bits          TEXT NOT NULL,
+    halfwidth     TEXT NOT NULL,
+    disposition   TEXT NOT NULL,
+    PRIMARY KEY (admission_id, pulse_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS calibration_pulses (
+    segment_id    TEXT NOT NULL,
+    pulse_id      TEXT NOT NULL,
+    revision      INTEGER NOT NULL,
+    tick          INTEGER NOT NULL,
+    bits          TEXT NOT NULL,
+    halfwidth     TEXT NOT NULL,
+    lo            TEXT NOT NULL,
+    hi            TEXT NOT NULL,
+    admission_id  INTEGER NOT NULL,
+    PRIMARY KEY (segment_id, pulse_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS calibration_products (
+    product_id       TEXT PRIMARY KEY,
+    segment_id       TEXT NOT NULL REFERENCES calibration_segments(segment_id),
+    station_id       TEXT NOT NULL,
+    slope_lo         TEXT NOT NULL,
+    slope_hi         TEXT NOT NULL,
+    feasible_lo      TEXT NOT NULL,
+    feasible_hi      TEXT NOT NULL,
+    witness_a        TEXT NOT NULL,
+    witness_b        TEXT NOT NULL,
+    ticks_json       TEXT NOT NULL,
+    moments_json     TEXT NOT NULL,
+    content_digest   TEXT NOT NULL,
+    created_at       TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS calibration_product_pulse (
+    product_id    TEXT NOT NULL REFERENCES calibration_products(product_id),
+    pulse_id      TEXT NOT NULL,
+    revision      INTEGER NOT NULL,
+    tick          INTEGER NOT NULL,
+    bits          TEXT NOT NULL,
+    halfwidth     TEXT NOT NULL,
+    lo            TEXT NOT NULL,
+    hi            TEXT NOT NULL,
+    PRIMARY KEY (product_id, pulse_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS calibration_attempts (
+    attempt_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id     TEXT NOT NULL,
+    segment_id     TEXT NOT NULL,
+    status         TEXT NOT NULL,
+    reasons_json   TEXT NOT NULL,
+    created_at     TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS paired_deliveries (
+    pair_id           TEXT PRIMARY KEY,
+    mode              TEXT NOT NULL,
+    classification    TEXT NOT NULL,
+    product_1         TEXT NOT NULL,
+    product_2         TEXT NOT NULL,
+    request_json      TEXT NOT NULL,
+    request_digest    TEXT NOT NULL,
+    evidence_json     TEXT NOT NULL,
+    content_digest    TEXT NOT NULL,
+    created_at        TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS paired_delivery_attempts (
+    attempt_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    pair_id        TEXT NOT NULL,
+    request_digest TEXT NOT NULL,
+    status         TEXT NOT NULL,
+    classification TEXT NOT NULL,
+    reasons_json   TEXT NOT NULL,
+    evidence_json  TEXT NOT NULL,
+    created_at     TEXT NOT NULL
 );
 """
 

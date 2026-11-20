@@ -10,15 +10,23 @@ Two responsibilities with a real boundary:
   decimal delivery, fail-closed and all-or-nothing.
 """
 
+from .calibration import CalibrationService
 from .contracts import ReaderContract
 from .delivery import DeliveryService
 from .delivery_algo import ScaleAttempt, Selection, round_half_even, select_representation
 from .errors import (
     BatchRejected,
+    CalibrationConflict,
+    CalibrationNotFound,
+    CalibrationRejected,
     DeliveryIdConflict,
     DeliveryNotFound,
     DeliveryRejected,
     IntegrityError,
+    PairDeliveryNotSatisfied,
+    PairIdConflict,
+    PairNotFound,
+    PairRequestRejected,
     ProductConflict,
     ProductNotFound,
     ReferenceConflict,
@@ -27,11 +35,17 @@ from .errors import (
     ReportNotFound,
     ValidationError,
 )
+from .pairing import ALL, NONE, PARTIAL, PairDeliveryService
 from .semantics import decode, interpret, judge, parse_bits
 from .service import SemanticsService
 from .storage import Store
 
 __all__ = [
+    "CalibrationService",
+    "PairDeliveryService",
+    "ALL",
+    "PARTIAL",
+    "NONE",
     "ReaderContract",
     "DeliveryService",
     "ScaleAttempt",
@@ -39,10 +53,17 @@ __all__ = [
     "round_half_even",
     "select_representation",
     "BatchRejected",
+    "CalibrationConflict",
+    "CalibrationNotFound",
+    "CalibrationRejected",
     "DeliveryIdConflict",
     "DeliveryNotFound",
     "DeliveryRejected",
     "IntegrityError",
+    "PairDeliveryNotSatisfied",
+    "PairIdConflict",
+    "PairNotFound",
+    "PairRequestRejected",
     "ProductConflict",
     "ProductNotFound",
     "ReferenceConflict",

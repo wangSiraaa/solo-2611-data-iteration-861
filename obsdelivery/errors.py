@@ -70,5 +70,72 @@ class DeliveryRejected(Exception):
         )
 
 
+class CalibrationNotFound(KeyError):
+    pass
+
+
+class CalibrationConflict(Exception):
+    """A segment or calibration product id exists with different content."""
+
+
+class CalibrationRejected(Exception):
+    """Pulse constraints are inconsistent, so no calibration product is written.
+
+    ``feasible_slope`` and ``witness`` describe the (possibly empty) feasible
+    slope interval with exact boundary evidence; ``attempt_id`` identifies the
+    audit entry, not a successful product identity.
+    """
+
+    def __init__(
+        self,
+        product_id: str,
+        reasons: Iterable[Mapping[str, Any]],
+        attempt_id: int | None = None,
+    ):
+        self.product_id = product_id
+        self.reasons = list(reasons)
+        self.attempt_id = attempt_id
+        super().__init__(
+            f"calibration product {product_id!r} rejected: " + repr(self.reasons)
+        )
+
+
+class PairRequestRejected(Exception):
+    """A paired-delivery request is malformed or its calibration is inconsistent."""
+
+    def __init__(self, package_id: str, reasons: Iterable[Mapping[str, Any]]):
+        self.package_id = package_id
+        self.reasons = list(reasons)
+        super().__init__(
+            f"paired delivery {package_id!r} rejected: " + repr(self.reasons)
+        )
+
+
+class PairDeliveryNotSatisfied(Exception):
+    """The request is well-formed but no admissible calibration meets the bar.
+
+    Carries the exact overlap extremes so the caller can check the verdict:
+    ``max_overlap < min_common`` proves NONE.  Nothing is published.
+    """
+
+    def __init__(self, package_id: str, evidence: Mapping[str, Any], attempt_id: int | None = None):
+        self.package_id = package_id
+        self.evidence = dict(evidence)
+        self.attempt_id = attempt_id
+        super().__init__(
+            f"paired delivery {package_id!r} not satisfied: "
+            f"max_overlap={evidence.get('max_overlap')!r} "
+            f"< min_common={evidence.get('threshold')!r}"
+        )
+
+
+class PairIdConflict(Exception):
+    """A published pair id is being reused with a different request."""
+
+
+class PairNotFound(KeyError):
+    pass
+
+
 class IntegrityError(Exception):
     """Stored immutable content failed independent read-back verification."""

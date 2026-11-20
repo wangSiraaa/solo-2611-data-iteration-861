@@ -10,9 +10,12 @@ obsdelivery/
   delivery_algo.py  十进制表示选择（纯函数，无存储）
   contracts.py      独立读者合同校验与身份
   delivery.py       交付任务：产品 × 样品集 × 合同，全有或全无
+  calibration_algo.py 段校准可行性 + 成对曝光重合判定（纯函数，无存储）
+  calibration.py    段校准产品：脉冲版本接纳、一致性求解、不可变读回
+  pairing.py        成对同拍交付：ALL/PARTIAL/NONE 判定 + 持久化
   public.py         公开产品/交付文档 + 独立读回校验
   storage.py        SQLite schema（不可变表 + 显式事务）
-  demo.py           跑 materials/739 + J0/J1
+  demo.py           跑 materials/739 + J0/J1 + 校时/成对示例
 tests/              精确断言、失败原子性、规模测试
 ```
 
@@ -123,8 +126,77 @@ reader 值与状态一致性。
   （读者值 `3/25`，误差 `−1/200`）；`s2` → `coefficient=0, scale=2`，保留
   `80000000` 与 `sign=1`。J0 被拒不影响语义服务继续查询 `s1` 的 `PASS`。
 
-## 6. 规模
+## 6. 校时脉冲与段校准产品
+
+一个**段**是某台站在一个有效采集段内的采集范围。段内本机 `tick` 到站外时间
+的换算是未知的有理仿射映射 `T = a·tick + b`：
+
+* 斜率 `a` 落在该段给定的正闭区间 `[slope_lo, slope_hi]`（`0 < lo ≤ hi`）；
+* 截距 `b` 只由校时脉冲约束。每个脉冲给定整数 `tick` 与真实到达时间的闭区间
+  `[lo, hi]`，约束为 `lo ≤ a·tick + b ≤ hi`。
+
+脉冲参考值用现有样本位型给出：按 `(pulse_id, revision)` 追加，最高 revision
+生效；同版同位型 → 重放；同版异位型 → 整批拒绝；低版合法但不覆盖高版——
+与观测接纳规则完全一致。误差半宽另给成有理数，故到达区间
+`[value − halfwidth, value + halfwidth]`。位型非有限（NaN/Inf）的脉冲参考被拒绝。
+
+**一致性**（`calibration_algo.evaluate_calibration`，纯函数）先消去 `b`：
+对固定 `a`，可行截距是 `[max(lo_i − a·tick_i), min(hi_i − a·tick_i)]`，非空即
+一致。于是对每个有序脉冲对得到斜率的一个界
+`(lo_i − hi_j)/(tick_i − tick_j)`，可行 `a` 集是一个闭区间；同 tick 的脉冲还须
+有公共到达点。不一致时返回**空区间**与具体越界脉冲对作为证据。
+
+`CalibrationService.publish_calibration_product` 把**生效**脉冲、可行斜率区间、
+一个可行 `(a,b)` 见证、以及段内多个时刻之间的关联固化为不可变行：
+
+* 每个时刻 `tick` 的可达区间 `[a·tick+b]`；
+* 任意两时刻的差值只依赖共享斜率（`a·(tick_j−tick_i)`），记录其区间，
+  这样"同一段多个时刻"保持相关，而不是被当作独立测量。
+
+一致 → 发布并可反复读回（重开数据库后仍据原脉冲还原，摘要自校验）；
+不一致 → **拒绝新产品**，只在 `calibration_attempts` 留审计，不占用成功 id，
+历史产品保持可消费。`public.verify_public_calibration` 无需数据库即可重算
+可行区间、见证与时刻关联。
+
+## 7. 成对同拍交付
+
+交付申请：两次曝光各自的起点 `start_tick`（整数）与持续时长 `duration`
+（站外时间，有理数，严格为正），以及规定的最少共同曝光 `min_common`。
+每次曝光锚定一个已发布的段校准产品。
+
+* 两次曝光在**同一段**（按 `segment_id` 判定）时**共用一份校准**：起点差
+  `Δ = a·(tick2 − tick1)`，截距消掉，重合只随 `a` 变。由于 `a>0`，重合在
+  `feasible_lo` 取最大、在 `feasible_hi` 取最小。若两曝光引用同一段下内容
+  不同的两个产品，则视为歧义并拒绝（`same_segment_calibration_mismatch`）。
+* 两次曝光在**不同段/独立站**时各自独立选取校准：各自起点为区间，起点差
+  `Δ` 落在闭区间内，重合是关于 `Δ` 的分段线性（帐篷）函数，极值在 `0` 与两端。
+
+判定三值：**ALL**（每种合法校准都够）、**PARTIAL**（只有部分够）、
+**NONE**（一种都不够）。`evaluate` 只算不写；`submit`：
+
+* ALL/PARTIAL → 固化为不可变 `paired_deliveries` 行，保存请求、判定、
+  重合极值 `[min,max]`、以及一个可核查的实例（具体 `(a,b)`、两曝光真实起点、
+  起点差、重合）；同版本重复提交返回原摘要（`created=False`），异请求同 id
+  抛 `PairIdConflict`。
+* NONE → 不写成功行，抛 `PairDeliveryNotSatisfied`，携带同样的边界证据
+  （`max_overlap < min_common` 即可复核），并在 `paired_delivery_attempts`
+  留审计。判定是存储产品的确定性函数，重开数据库后重复提交得到同一结论。
+
+`public.verify_public_pair` 由文档本身重算：判定须与重合极值及门槛一致
+（`ALL ⟺ min≥门槛`，`NONE ⟺ max<门槛`，否则 `PARTIAL`），且 `NONE` 不得被
+发布；见证实例的重合须与其起点差、时长相符。
+
+示例（demo 的 `sync` 段）：
+
+* 两独立站、固定斜率 1、各时长 3、tick 0 偏移均在 `[0,2]`，门槛 2 → **PARTIAL**
+  （重合区间 `[1,3]`）；把两站脉冲收紧到偏移 1 → **ALL**。
+* 保持原产品，同一站同一段 tick 0 与 tick 1 两次曝光、门槛 2 → **ALL**
+  （恰好重合 2）；门槛改 `5/2` → **NONE**。
+* 非单位斜率（脉冲互约束得斜率 `∈[9/10,11/10]`）与另一站贯通校准、申请和公开读回。
+
+## 8. 规模
 
 测试覆盖 5000 观测（1000 样品 × 5 版）、100 个参考版本、单次 1000 样品的
 语义产品与交付，以及独立读回校验；本地全部 < 2 秒。不做概率统计、浮点求和
-或硬件异常模拟。
+或硬件异常模拟。校时/成对部分只用精确有理数，配对判定为 O(脉冲对) 级，
+额外的规模测试覆盖数百脉冲、多段多时刻产品与成对读回。

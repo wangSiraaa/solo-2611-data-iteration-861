@@ -257,6 +257,133 @@ def run(input_path: Path, db_path: str | None = None) -> dict:
     return log
 
 
+def run_sync() -> dict:
+    """Drive the calibration + paired-delivery subsystem through the worked cases.
+
+    All fractions are exact; the same fixed slope band and pulse samples are
+    used as the task statement, plus a non-unit-slope case with mutually
+    constraining pulses.
+    """
+    from .calibration import CalibrationService
+    from .pairing import PairDeliveryService
+    from .public import (
+        public_calibration_product,
+        public_paired_delivery,
+        verify_public_calibration,
+        verify_public_pair,
+    )
+
+    store = Store(":memory:")
+    cal = CalibrationService(store)
+    pair = PairDeliveryService(store, cal)
+    log: dict = {"steps": []}
+
+    def _pulse(pid, tick, bits, halfwidth, revision=1):
+        return {"pulse_id": pid, "revision": revision, "tick": tick,
+                "bits": bits, "halfwidth": halfwidth}
+
+    ONE, ZERO, TEN = "3f800000", "00000000", "41200000"
+
+    # Two independent stations, each with a unit slope and a tick-0 offset in [0,2].
+    for seg in ("a", "b"):
+        cal.register_segment(seg, seg.upper(), "1", "1")
+        cal.admit_pulses(seg, [_pulse("p0", 0, ONE, "1")])
+    pa = cal.publish_calibration_product("PA", "a", ticks=[0])
+    cal.publish_calibration_product("PB", "b", ticks=[0])
+    log["steps"].append({
+        "op": "calibration",
+        "product": "PA",
+        "feasible_slope": pa["feasible_slope"],
+        "offset_range": pa["moments"]["per_tick"]["0"],
+        "public_problems": verify_public_calibration(public_calibration_product(cal, "PA")),
+    })
+
+    base = {
+        "exposure_1": {"product_id": "PA", "start_tick": 0, "duration": 3},
+        "exposure_2": {"product_id": "PB", "start_tick": 0, "duration": 3},
+    }
+    got = pair.evaluate({**base, "min_common": "2"})
+    log["steps"].append({
+        "op": "pair",
+        "case": "two independent stations, min 2",
+        "mode": got["mode"],
+        "classification": got["classification"],
+        "min_overlap": got["min_overlap"],
+        "max_overlap": got["max_overlap"],
+    })
+
+    # Tighten both offsets to exactly 1 -> guaranteed.
+    for seg in ("a", "b"):
+        cal.admit_pulses(seg, [_pulse("p0", 0, ONE, "0", revision=2)])
+    cal.publish_calibration_product("PA2", "a", ticks=[0])
+    cal.publish_calibration_product("PB2", "b", ticks=[0])
+    tight = {
+        "exposure_1": {"product_id": "PA2", "start_tick": 0, "duration": 3},
+        "exposure_2": {"product_id": "PB2", "start_tick": 0, "duration": 3},
+        "min_common": "2",
+    }
+    got = pair.evaluate(tight)
+    log["steps"].append({
+        "op": "pair",
+        "case": "offsets pinned to 1, min 2",
+        "mode": got["mode"],
+        "classification": got["classification"],
+        "min_overlap": got["min_overlap"],
+        "max_overlap": got["max_overlap"],
+    })
+
+    # Same station, same segment: ticks 0 and 1, shared calibration.
+    shared = {
+        "exposure_1": {"product_id": "PA2", "start_tick": 0, "duration": 3},
+        "exposure_2": {"product_id": "PA2", "start_tick": 1, "duration": 3},
+    }
+    for threshold, label in (("2", "min 2"), ("5/2", "min 5/2")):
+        verdict = pair.evaluate({**shared, "min_common": threshold})
+        log["steps"].append({
+            "op": "pair",
+            "case": f"shared segment ticks 0/1, {label}",
+            "mode": verdict["mode"],
+            "classification": verdict["classification"],
+            "min_overlap": verdict["min_overlap"],
+            "max_overlap": verdict["max_overlap"],
+        })
+    published = pair.submit("SHARED-2", {**shared, "min_common": "2"})
+    log["steps"].append({
+        "op": "pair",
+        "case": "shared segment published at min 2",
+        "classification": published["classification"],
+        "public_problems": verify_public_pair(public_paired_delivery(pair, "SHARED-2")),
+    })
+
+    # Non-unit slope with mutually constraining pulses: slope in [9/10, 11/10].
+    cal.register_segment("x", "X", "1/2", "2")
+    cal.admit_pulses("x", [_pulse("p0", 0, ZERO, "1/2"), _pulse("p10", 10, TEN, "1/2")])
+    px = cal.publish_calibration_product("PX", "x", ticks=[0, 5, 10])
+    non_unit = pair.evaluate({
+        "exposure_1": {"product_id": "PX", "start_tick": 0, "duration": 4},
+        "exposure_2": {"product_id": "PB2", "start_tick": 0, "duration": 4},
+        "min_common": "3",
+    })
+    log["steps"].append({
+        "op": "calibration",
+        "product": "PX",
+        "feasible_slope": px["feasible_slope"],
+        "moment_differences": px["moments"]["differences"],
+    })
+    log["steps"].append({
+        "op": "pair",
+        "case": "non-unit slope PX vs PB2, min 3",
+        "mode": non_unit["mode"],
+        "classification": non_unit["classification"],
+        "min_overlap": non_unit["min_overlap"],
+        "max_overlap": non_unit["max_overlap"],
+        "public_problems": verify_public_calibration(public_calibration_product(cal, "PX")),
+    })
+
+    store.close()
+    return log
+
+
 def _delivery_summary(delivery: dict) -> dict:
     return {
         "delivery_id": delivery["delivery_id"],
@@ -294,10 +421,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="emit JSON instead of text")
     args = parser.parse_args(argv)
     result = run(Path(args.input), args.db)
+    sync_log = run_sync()
     if args.json:
+        result["sync"] = sync_log
         print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
         return 0
     _print_text(result)
+    _print_sync(sync_log)
     return 0
 
 
@@ -384,6 +514,35 @@ def _print_text(log: dict) -> None:
                   f"bits={step['s1_r2_bits']}")
         else:
             print(f"\n[{op}] {step}")
+
+
+def _print_sync(log: dict) -> None:
+    print("\n\n=== calibration + paired same-shot delivery ===")
+    for step in log["steps"]:
+        if step["op"] == "calibration":
+            print(f"\n[calibration {step['product']}] feasible slope "
+                  f"{step['feasible_slope']}")
+            if "offset_range" in step:
+                rng = step["offset_range"]
+                print(f"  tick-0 achievable interval: [{rng['value_lo']}, {rng['value_hi']}]")
+            if step.get("moment_differences"):
+                for d in step["moment_differences"]:
+                    print(f"  ticks {d['from_tick']}->{d['to_tick']}: "
+                          f"difference in [{d['difference_lo']}, {d['difference_hi']}]")
+            if step.get("public_problems") is not None:
+                print(f"  independent read-back problems: "
+                      f"{step['public_problems'] or 'none'}")
+        elif step["op"] == "pair":
+            tag = step.get("mode", "")
+            if "min_overlap" in step:
+                print(f"\n[pair: {step['case']}] mode={tag} "
+                      f"-> {step['classification']} "
+                      f"(overlap [{step['min_overlap']}, {step['max_overlap']}])")
+            else:
+                print(f"\n[pair: {step['case']}] -> {step['classification']}")
+            if "public_problems" in step:
+                print(f"  independent read-back problems: "
+                      f"{step['public_problems'] or 'none'}")
 
 
 if __name__ == "__main__":
